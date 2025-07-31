@@ -1,100 +1,158 @@
 #include <SPI.h>
 #include <MFRC522.h>
 #include <Wire.h>
-#include <Adafruit_GFX.h>
-#include <Adafruit_SSD1306.h>
-#include <Servo.h> // Include the Servo library
+#include <LiquidCrystal_I2C.h>
+#include <Servo.h>
 
 #define RST_PIN 9
 #define SS_PIN 10
-
-byte readCard[4];
-String My_ID = "B3156C9F";
-String ID = "";
+#define AMOUNT_TO_DEDUCT 10
+#define LOW_BALANCE_THRESHOLD 10
+#define JOY_BUTTON_PIN 8      // Joystick button connected to pin 8
+#define RECHARGE_AMOUNT 50
+#define HOLD_DURATION 3000    // milliseconds to consider as long hold
 
 MFRC522 mfrc522(SS_PIN, RST_PIN);
-Adafruit_SSD1306 display = Adafruit_SSD1306(128, 64, &Wire, -1);
-Servo servo; // Create a servo object
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+Servo servo;
 
-void setup()
-{
+String ID = "";
+
+unsigned long holdStart = 0;
+bool isHolding = false;
+
+// Define wallet structure
+struct Wallet {
+  String uid;
+  int balance;
+};
+
+Wallet users[] = {
+  {"83C9CDF4", 28},
+  {"DEADBEEF", 30},
+  {"A1B2C3D4", 100}
+};
+
+const int numUsers = sizeof(users) / sizeof(users[0]);
+
+void setup() {
   SPI.begin();
   mfrc522.PCD_Init();
-  display.begin(SSD1306_SWITCHCAPVCC, 0x3C);
-  servo.attach(6); // Attach the servo to pin 6
 
-  display.clearDisplay();
-  display.setTextColor(WHITE);
-  display.setCursor(0, 0);
-  display.setTextSize(1);
-  display.print("Scan Your Card...");
-  display.display();
+  lcd.init();
+  lcd.backlight();
+
+  servo.attach(6);
+  servo.write(0);
+
+  pinMode(JOY_BUTTON_PIN, INPUT_PULLUP);  // Joystick button connected to pin 8
+
+  lcd.setCursor(0, 0);
+  lcd.print("Scan Your Card...");
 }
 
-void loop()
-{
-  while (getID())
-  {
-    display.clearDisplay();
-    display.setCursor(0, 0);
-    display.setTextSize(1);
-
-    if (ID == My_ID)
-    {
-      display.print("ACCESS GRANTED!");
-      openServo(); // Call the openServo function if access is granted
-    }
-    else
-    {
-      display.print("ACCESS DENIED!");
-    }
-
-    display.display();
-    display.setCursor(0, 10);
-    display.print(" ID : ");
-    display.print(ID);
-    display.display();
-
-    delay(2000);
-
-    display.clearDisplay();
-    display.print(" Access Control ");
-    display.setCursor(0, 10);
-    display.print("Scan Your Card...");
-    display.display();
-    closeServo(); // Call the closeServo function after a delay
+void loop() {
+  if (!mfrc522.PICC_IsNewCardPresent()) {
+    checkJoystickPress();
+    return;
   }
-}
 
-boolean getID()
-{
-  if (!mfrc522.PICC_IsNewCardPresent())
-  {
-    return false;
-  }
-  if (!mfrc522.PICC_ReadCardSerial())
-  {
-    return false;
-  }
+  if (!mfrc522.PICC_ReadCardSerial()) return;
+
   ID = "";
-  for (uint8_t i = 0; i < 4; i++)
-  {
-    //readCard[i] = mfrc522.uid.uidByte[i];
-    ID.concat(String(mfrc522.uid.uidByte[i], HEX));
+  for (byte i = 0; i < mfrc522.uid.size; i++) {
+    ID += String(mfrc522.uid.uidByte[i], HEX);
   }
   ID.toUpperCase();
+
+  int userIndex = findUser(ID);
+
+  lcd.clear();
+
+  if (userIndex != -1) {
+    if (users[userIndex].balance >= AMOUNT_TO_DEDUCT) {
+      users[userIndex].balance -= AMOUNT_TO_DEDUCT;
+
+      lcd.setCursor(0, 0);
+      lcd.print("ACCESS GRANTED!");
+      lcd.setCursor(0, 1);
+      lcd.print("Bal: Rs ");
+      lcd.print(users[userIndex].balance);
+      openServo();
+
+      delay(3000);
+
+      // Check if balance dropped below warning threshold
+      if (users[userIndex].balance < LOW_BALANCE_THRESHOLD) {
+        lcd.clear();
+        lcd.setCursor(0, 0);
+        lcd.print("Low Balance!");
+        lcd.setCursor(0, 1);
+        lcd.print("Recharge soon");
+        delay(2000);
+      }
+
+    } else {
+      lcd.setCursor(0, 0);
+      lcd.print("ACCESS DENIED!");
+      lcd.setCursor(0, 1);
+      lcd.print("Insufficient Rs");
+    }
+  } else {
+    lcd.setCursor(0, 0);
+    lcd.print("ACCESS DENIED!");
+    lcd.setCursor(0, 1);
+    lcd.print("Unknown Card");
+  }
+
+  delay(3000);
+  closeServo();
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Scan Your Card...");
+
   mfrc522.PICC_HaltA();
-  return true;
 }
 
-void openServo()
-{
-  servo.write(90); // Set the servo to the open position (adjust the angle as needed)
-  delay(1000);    // Delay to allow the servo to move
+// Checks for joystick button press to recharge
+void checkJoystickPress() {
+  if (digitalRead(JOY_BUTTON_PIN) == LOW) { // Joystick button pressed (button is active LOW)
+    rechargeCard();
+  }
 }
 
-void closeServo()
-{
-  servo.write(0); // Set the servo to the closed position (adjust the angle as needed)
-  delay(1000);   // Delay to allow the servo to move
-}123
+void rechargeCard() {
+  if (ID == "") return; // No card scanned yet
+
+  int index = findUser(ID);
+  if (index != -1) {
+    users[index].balance += RECHARGE_AMOUNT;
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("Recharge Done!");
+    lcd.setCursor(0, 1);
+    lcd.print("Bal: Rs ");
+    lcd.print(users[index].balance);
+    delay(3000);
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("Scan Your Card...");
+  }
+}
+
+int findUser(String uid) {
+  for (int i = 0; i < numUsers; i++) {
+    if (users[i].uid == uid) return i;
+  }
+  return -1;
+}
+
+void openServo() {
+  servo.write(90);
+  delay(1000);
+}
+
+void closeServo() {
+  servo.write(0);
+  delay(1000);
+}
